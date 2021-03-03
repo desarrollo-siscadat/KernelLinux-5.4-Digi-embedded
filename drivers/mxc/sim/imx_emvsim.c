@@ -29,9 +29,6 @@
 #include <linux/spinlock.h>
 #include <linux/time.h>
 #include <linux/types.h>
-#include <linux/pinctrl/consumer.h>
-#include <linux/pm_domain.h>
-#include <linux/pm_runtime.h>
 
 #define	DRIVER_NAME	"mxc_emvsim"
 
@@ -94,8 +91,6 @@
 #define	EMV_RESET_LOW_CYCLES		40000
 #define	ATR_MAX_DELAY_CLK		46400
 #define	DIVISOR_VALUE			372
-#define	CWT_ADJUSTMENT			2
-#define	BGT_BWT_ADJUSTMENT		2
 
 #define	SIM_CNTL_GPCNT0_CLK_SEL_MASK	(3 << 10)
 #define	SIM_CNTL_GPCNT0_CLK_SEL(x)	((x & 3) << 10)
@@ -201,11 +196,6 @@ struct emvsim_t {
 	spinlock_t lock;
 	u32 clk_rate;
 	u8 checking_ts_timing;
-	u8 tx_last_character;
-
-	/* multiple power domain for emvsim */
-        struct device *sim_pd;
-        struct device *sim_aux_pd;
 };
 
 static struct miscdevice emvsim_dev;
@@ -412,19 +402,14 @@ static void emvsim_receive_atr_set(struct emvsim_t *emvsim)
 {
 	u32 reg_data;
 
-	/* GPCNT0 with Card clock is for ATR maximum delay
-	 * GPCNT1 with ETU clock is for ART maximum duration
-	 */
-	emvsim_mask_timer1_int(emvsim);
 	__raw_writel(0x0, emvsim->ioaddr + EMV_SIM_GPCNT1_VAL);
 	emvsim_set_gpctimer1_clk(emvsim, SIM_CNTL_GPCNT_ETU_CLK);
 	emvsim_set_rx(emvsim, 1);
 
 	/*Set the cwt timer.Refer the setting of ATR on EMV4.3 book*/
-	__raw_writel(ATR_MAX_CWT + CWT_ADJUSTMENT, emvsim->ioaddr + EMV_SIM_CWT_VAL);
+	__raw_writel(ATR_MAX_CWT, emvsim->ioaddr + EMV_SIM_CWT_VAL);
 
 	reg_data = __raw_readl(emvsim->ioaddr + EMV_SIM_CTRL);
-	reg_data |= ICM;
 	reg_data |= CWT_EN;
 	__raw_writel(reg_data, emvsim->ioaddr + EMV_SIM_CTRL);
 
@@ -444,6 +429,9 @@ static int32_t emvsim_check_rec_data(u32 *reg_data)
 {
 	s32 err = 0;
 
+	if (*reg_data & CWT_ERR)
+		err |= SIM_ERROR_CWT;
+
 	if (*reg_data & FEF)
 		err |= SIM_ERROR_FRAME;
 
@@ -453,58 +441,23 @@ static int32_t emvsim_check_rec_data(u32 *reg_data)
 	return err;
 }
 
-static void emvsim_enable_guardtime(struct emvsim_t *emvsim, int enable)
-{
-	/* transmitter: set Guard Time Value in ETU */
-	if (enable) {
-		if (emvsim->protocol_type == SIM_PROTOCOL_T0) {
-			/*
-			 * From EMV4.3, TotalETU = 12 + CGT.
-			 * If cgt equals 0xFF, TotalETU = 12.
-			 */
-			if (emvsim->timing_data.cgt == 0xFF)
-				__raw_writel(0, emvsim->ioaddr + EMV_SIM_TX_GETU);
-			else
-				__raw_writel(emvsim->timing_data.cgt,
-					     emvsim->ioaddr + EMV_SIM_TX_GETU);
-		} else if (emvsim->protocol_type == SIM_PROTOCOL_T1) {
-			/*
-			 * From EMV4.3, TotalETU = 12 + CGT.
-			 * If cgt equals 0xFF, TotalETU = 11.
-			 */
-			__raw_writel(emvsim->timing_data.cgt,
-				     emvsim->ioaddr + EMV_SIM_TX_GETU);
-		}
-	} else {
-		__raw_writel(0, emvsim->ioaddr + EMV_SIM_TX_GETU);
-	}
-}
-
 static void emvsim_xmt_fill_fifo(struct emvsim_t *emvsim)
 {
 	u32 reg_data;
 	u32 bytesleft, i;
 
-	if (!emvsim->tx_last_character) {
-		reg_data = __raw_readl(emvsim->ioaddr + EMV_SIM_TX_STATUS);
-		bytesleft = SIM_TX_FIFO_DEPTH - ((reg_data >> 24) & 0x1F);
+	reg_data = __raw_readl(emvsim->ioaddr + EMV_SIM_TX_STATUS);
+	bytesleft = SIM_TX_FIFO_DEPTH - ((reg_data >> 24) & 0x1F);
 
-		if (bytesleft > emvsim->xmt_remaining)
-			bytesleft = emvsim->xmt_remaining;
+	if (bytesleft > emvsim->xmt_remaining)
+		bytesleft = emvsim->xmt_remaining;
 
-		for (i = 0; i < bytesleft; i++) {
-			__raw_writel(emvsim->xmt_buffer[emvsim->xmt_pos],
-				     emvsim->ioaddr + EMV_SIM_TX_BUF);
-			emvsim->xmt_pos++;
-		};
-		emvsim->xmt_remaining -= bytesleft;
-	} else {
-		/* clear guard time before sending last character */
-		emvsim_enable_guardtime(emvsim, 0);
-
+	for (i = 0; i < bytesleft; i++) {
 		__raw_writel(emvsim->xmt_buffer[emvsim->xmt_pos],
 			     emvsim->ioaddr + EMV_SIM_TX_BUF);
-	}
+		emvsim->xmt_pos++;
+	};
+	emvsim->xmt_remaining -= bytesleft;
 };
 
 static void emvsim_rcv_read_fifo(struct emvsim_t *emvsim)
@@ -552,7 +505,7 @@ static void emvsim_tx_irq_enable(struct emvsim_t *emvsim)
 	__raw_writel(reg_val, emvsim->ioaddr + EMV_SIM_RX_STATUS);
 
 	reg_val = __raw_readl(emvsim->ioaddr + EMV_SIM_INT_MASK);
-	reg_val |= CWT_ERR_IM | BWT_ERR_IM | RX_DATA_IM | RNACK_IM;
+	reg_val |= CWT_ERR_IM | BWT_ERR_IM | RX_DATA_IM | RX_DATA_IM;
 
 	if (emvsim->xmt_remaining != 0) {
 		reg_val &= ~TDT_IM;
@@ -584,14 +537,11 @@ static void emvsim_rx_irq_enable(struct emvsim_t *emvsim)
 {
 	u32 reg_data;
 
-	/*Clear the TX&RX status, W1C */
-	reg_data = __raw_readl(emvsim->ioaddr + EMV_SIM_TX_STATUS);
-	__raw_writel(reg_data, emvsim->ioaddr + EMV_SIM_TX_STATUS);
-	reg_data = __raw_readl(emvsim->ioaddr + EMV_SIM_RX_STATUS);
-	__raw_writel(reg_data, emvsim->ioaddr + EMV_SIM_RX_STATUS);
+	 /* Ensure the CWT timer is enabled */
+	emvsim_set_cwt(emvsim, 1);
 
 	reg_data = __raw_readl(emvsim->ioaddr + EMV_SIM_INT_MASK);
-	reg_data |= (TC_IM | TDT_IM | TNACK_IM | ETC_IM);
+	reg_data |= (TC_IM | TDT_IM | TNACK_IM);
 	reg_data &= ~(RX_DATA_IM | CWT_ERR_IM | BWT_ERR_IM);
 
 	if (emvsim->protocol_type == SIM_PROTOCOL_T0 ||
@@ -619,7 +569,7 @@ static irqreturn_t emvsim_irq_handler(int irq, void *dev_id)
 
 	/* clear TX/RX interrupt status, W1C*/
 	tx_status  = __raw_readl(emvsim->ioaddr + EMV_SIM_TX_STATUS);
-	rx_status  = __raw_readl(emvsim->ioaddr + EMV_SIM_RX_STATUS) & ~(PEF | FEF);
+	rx_status  = __raw_readl(emvsim->ioaddr + EMV_SIM_RX_STATUS);
 	__raw_writel(tx_status, emvsim->ioaddr + EMV_SIM_TX_STATUS);
 	__raw_writel(rx_status, emvsim->ioaddr + EMV_SIM_RX_STATUS);
 
@@ -642,8 +592,6 @@ static irqreturn_t emvsim_irq_handler(int irq, void *dev_id)
 
 			emvsim_mask_timer0_int(emvsim);
 
-			emvsim_rcv_read_fifo(emvsim);
-
 			/* ATR each received byte will cost 12 ETU */
 			reg_data = ATR_MAX_DURATION - emvsim->rcv_count * 12;
 			__raw_writel(reg_data,  emvsim->ioaddr + EMV_SIM_GPCNT1_VAL);
@@ -651,6 +599,11 @@ static irqreturn_t emvsim_irq_handler(int irq, void *dev_id)
 			reg_data = __raw_readl(emvsim->ioaddr + EMV_SIM_INT_MASK);
 			reg_data &= ~(GPCNT1_IM | CWT_ERR_IM | RX_DATA_IM);
 			__raw_writel(reg_data, emvsim->ioaddr + EMV_SIM_INT_MASK);
+			emvsim_rcv_read_fifo(emvsim);
+
+			reg_data = __raw_readl(emvsim->ioaddr + EMV_SIM_TX_STATUS);
+			reg_data |= GPCNT1_TO;
+			__raw_writel(reg_data, emvsim->ioaddr + EMV_SIM_TX_STATUS);
 
 			reg_data = SIM_RCV_THRESHOLD_RTH(0) | SIM_RCV_THRESHOLD_RDT(rdt);
 			__raw_writel(reg_data, emvsim->ioaddr + EMV_SIM_RX_THD);
@@ -722,12 +675,7 @@ static irqreturn_t emvsim_irq_handler(int irq, void *dev_id)
 				__raw_writel(reg_data, emvsim->ioaddr +
 					     EMV_SIM_INT_MASK);
 			}
-		} else if ((tx_status & TCF) && !emvsim->xmt_remaining &&
-			   !emvsim->tx_last_character) {
-			emvsim->tx_last_character = 1;
-			emvsim_xmt_fill_fifo(emvsim);
-		} else if ((tx_status & TCF) && !emvsim->xmt_remaining &&
-			   emvsim->tx_last_character) {
+		} else if ((tx_status & TCF) && !emvsim->xmt_remaining) {
 			emvsim_tx_irq_disable(emvsim);
 			emvsim_set_rx(emvsim, 1);
 			emvsim->state = SIM_STATE_XMT_DONE;
@@ -1011,26 +959,40 @@ static void emvsim_set_timer_counter(struct emvsim_t *emvsim)
 	}
 
 	if (emvsim->timing_data.bgt != 0)
-		__raw_writel(emvsim->timing_data.bgt - BGT_BWT_ADJUSTMENT,
+		__raw_writel(emvsim->timing_data.bgt,
 			     emvsim->ioaddr + EMV_SIM_BGT_VAL);
 
 	if (emvsim->timing_data.cwt != 0)
-		__raw_writel(emvsim->timing_data.cwt + CWT_ADJUSTMENT,
+		__raw_writel(emvsim->timing_data.cwt,
 			     emvsim->ioaddr + EMV_SIM_CWT_VAL);
 
 	if (emvsim->timing_data.bwt != 0)
-		__raw_writel(emvsim->timing_data.bwt + BGT_BWT_ADJUSTMENT,
+		__raw_writel(emvsim->timing_data.bwt,
 			     emvsim->ioaddr + EMV_SIM_BWT_VAL);
 
-	/* receiver: 12 etu and 11 etu, T0: 12ETU; T1: 11ETU */
+	/* 11 etu and 12 etu, T0: 12ETU; T1: 11ETU */
 	if (emvsim->protocol_type == SIM_PROTOCOL_T0) {
+		/*
+		 * From EMV4.3 , T0 mode means 12 ETU. TotalETU=12+CGT.
+		 * If cgt equals 0xFF, TotalETU = 12
+		 */
 		reg = __raw_readl(emvsim->ioaddr + EMV_SIM_CTRL);
 		reg &= ~RCVR_11;
 		 __raw_writel(reg, emvsim->ioaddr + EMV_SIM_CTRL);
+
+		/* set Transmitter Guard Time Value in ETU */
+		if (emvsim->timing_data.cgt == 0xFF)
+			__raw_writel(0, emvsim->ioaddr + EMV_SIM_TX_GETU);
+		else
+			__raw_writel(emvsim->timing_data.cgt,
+				     emvsim->ioaddr + EMV_SIM_TX_GETU);
 	} else if (emvsim->protocol_type == SIM_PROTOCOL_T1) {
+		/* From EMV4.3 , T1 mode means 11 ETU. TotalETU=11+CGT */
 		reg = __raw_readl(emvsim->ioaddr + EMV_SIM_CTRL);
 		reg |= RCVR_11;
 		__raw_writel(reg, emvsim->ioaddr + EMV_SIM_CTRL);
+		__raw_writel(emvsim->timing_data.cgt,
+			     emvsim->ioaddr + EMV_SIM_TX_GETU);
 	}
 }
 
@@ -1049,7 +1011,6 @@ static int emvsim_xmt_start(struct emvsim_t *emvsim)
 	}
 
 	emvsim_set_timer_counter(emvsim);
-	emvsim_enable_guardtime(emvsim, 1);
 
 	if (emvsim->xmt_remaining != 0) {
 		reg_val = __raw_readl(emvsim->ioaddr + EMV_SIM_TX_THD);
@@ -1091,7 +1052,6 @@ static void emvsim_start_rcv(struct emvsim_t *emvsim)
 	emvsim_set_rx(emvsim, 1);
 	emvsim_set_baud_rate(emvsim);
 	emvsim_set_timer_counter(emvsim);
-	emvsim_enable_guardtime(emvsim, 0);
 	emvsim_set_cwt(emvsim, 1);
 	emvsim_set_bwt(emvsim, 1);
 
@@ -1179,15 +1139,12 @@ static long emvsim_ioctl(struct file *file,
 		timeout = wait_for_completion_interruptible_timeout(
 				&emvsim->xfer_done, emvsim->timeout);
 
-		emvsim_set_rx(emvsim, 0);
-		emvsim_set_tx(emvsim, 0);
-
 		reg_data = __raw_readl(emvsim->ioaddr + EMV_SIM_CTRL);
 		reg_data &= ~CWT_EN;
 		__raw_writel(reg_data, emvsim->ioaddr + EMV_SIM_CTRL);
 
 		reg_data = __raw_readl(emvsim->ioaddr + EMV_SIM_INT_MASK);
-		reg_data |= (GPCNT0_IM | GPCNT1_IM | CWT_ERR_IM | RX_DATA_IM);
+		reg_data |= (GPCNT0_IM | CWT_ERR_IM);
 		__raw_writel(reg_data, emvsim->ioaddr + EMV_SIM_INT_MASK);
 
 		if (timeout == 0) {
@@ -1266,15 +1223,6 @@ static long emvsim_ioctl(struct file *file,
 			errval = ret;
 			break;
 		}
-
-		/* last character must be transmitted separately due to it
-		 * can't has guard time.
-		 */
-		emvsim->xmt_remaining -= 1;
-		if (!emvsim->xmt_remaining)
-			emvsim->tx_last_character = 1;
-		else
-			emvsim->tx_last_character = 0;
 
 		emvsim_clear_rx_buf(emvsim);
 		emvsim_set_cwt(emvsim, 0);
@@ -1357,6 +1305,8 @@ static long emvsim_ioctl(struct file *file,
 		if (emvsim->state != SIM_STATE_RECEIVING)
 			emvsim_start_rcv(emvsim);
 
+		spin_lock_irqsave(&emvsim->lock, flags);
+		spin_unlock_irqrestore(&emvsim->lock, flags);
 		emvsim->timeout = RX_TIMEOUT * HZ;
 		timeout = wait_for_completion_interruptible_timeout(
 				&emvsim->xfer_done, emvsim->timeout);
@@ -1441,11 +1391,7 @@ copy_data:
 			break;
 		}
 
-		ret = emvsim_check_baud_rate(&emvsim->baud_rate);
-		if (ret) {
-			dev_err(emvsim_dev.parent, "Invalid baud rate value\n");
-			errval = ret;
-		}
+		emvsim_check_baud_rate(&emvsim->baud_rate);
 
 		break;
 	case SIM_IOCTL_WAIT:
@@ -1490,11 +1436,12 @@ static int emvsim_open(struct inode *inode, struct file *file)
 		return errval;
 	}
 
-	emvsim->open_cnt = 1;
-	errval = pm_runtime_get_sync(emvsim_dev.parent);
-	if (errval < 0)
-		return errval;
+	if (!emvsim->open_cnt) {
+		clk_prepare_enable(emvsim->ipg);
+		clk_prepare_enable(emvsim->clk);
+	}
 
+	emvsim->open_cnt = 1;
 	init_completion(&emvsim->xfer_done);
 	errval = emvsim_reset_module(emvsim);
 	emvsim_data_reset(emvsim);
@@ -1514,7 +1461,11 @@ static int emvsim_release(struct inode *inode, struct file *file)
 	if (emvsim->present != SIM_PRESENT_REMOVED)
 		emvsim_deactivate(emvsim);
 
-	pm_runtime_put(emvsim_dev.parent);
+	if (emvsim->open_cnt) {
+		clk_disable_unprepare(emvsim->clk);
+		clk_disable_unprepare(emvsim->ipg);
+	}
+
 	emvsim->open_cnt = 0;
 
 	return 0;
@@ -1540,41 +1491,6 @@ static const struct of_device_id emvsim_imx_dt_ids[] = {
 
 MODULE_DEVICE_TABLE(of, emvsim_imx_dt_ids);
 
-static int emvsim_attach_multi_pd(struct device *dev, struct emvsim_t *emvsim)
-{
-        struct device_link *link;
-
-        /* Do nothing when in a signal power domain */
-        if (dev->pm_domain)
-                return 0;
-
-        emvsim->sim_pd = dev_pm_domain_attach_by_name(dev, "sim_pd");
-        if (IS_ERR(emvsim->sim_pd))
-                return PTR_ERR(emvsim->sim_pd);
-        link = device_link_add(dev, emvsim->sim_pd,
-                               DL_FLAG_STATELESS |
-                               DL_FLAG_PM_RUNTIME |
-                               DL_FLAG_RPM_ACTIVE);
-        if (IS_ERR(link)) {
-                dev_err(dev, "Failed to add device_link to EMVSIM pd: %ld\n", PTR_ERR(link));
-                return PTR_ERR(link);
-        }
-
-        emvsim->sim_aux_pd = dev_pm_domain_attach_by_name(dev, "sim_aux_pd");
-        if (IS_ERR(emvsim->sim_aux_pd))
-                return PTR_ERR(emvsim->sim_aux_pd);
-        link = device_link_add(dev, emvsim->sim_aux_pd,
-                               DL_FLAG_STATELESS |
-                               DL_FLAG_PM_RUNTIME |
-                               DL_FLAG_RPM_ACTIVE);
-        if (IS_ERR(link)) {
-                dev_err(dev, "Failed to add device_link to EMVSIM pd: %ld\n", PTR_ERR(link));
-                return PTR_ERR(link);
-        }
-
-        return 0;
-}
-
 static int emvsim_probe(struct platform_device *pdev)
 {
 	int ret = 0;
@@ -1593,10 +1509,11 @@ static int emvsim_probe(struct platform_device *pdev)
 		return -EINVAL;
 
 	emvsim->clk_rate = FCLK_FREQ;
+	emvsim->open_cnt = 0;
 
 	emvsim->res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!emvsim->res) {
-		dev_err(&pdev->dev, "Can't get the MEMORY\n");
+		dev_err(emvsim_dev.parent, "Can't get the MEMORY\n");
 		return -ENOMEM;
 	}
 	emvsim->ioaddr = devm_ioremap_resource(&pdev->dev, emvsim->res);
@@ -1611,14 +1528,14 @@ static int emvsim_probe(struct platform_device *pdev)
 	emvsim->clk = devm_clk_get(&pdev->dev, "sim");
 	if (IS_ERR(emvsim->clk)) {
 		ret = PTR_ERR(emvsim->clk);
-		dev_err(&pdev->dev, "Get PER CLK ERROR !\n");
+		dev_err(emvsim_dev.parent, "Get PER CLK ERROR !\n");
 		return ret;
 	}
 
 	emvsim->ipg = devm_clk_get(&pdev->dev, "ipg");
 	if (IS_ERR(emvsim->ipg)) {
 		ret = PTR_ERR(emvsim->ipg);
-		dev_err(&pdev->dev, "Get IPG CLK ERROR !\n");
+		dev_err(emvsim_dev.parent, "Get IPG CLK ERROR !\n");
 		return ret;
 	}
 
@@ -1637,31 +1554,7 @@ static int emvsim_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, emvsim);
 	emvsim_dev.parent = &pdev->dev;
 
-        ret = emvsim_attach_multi_pd(&pdev->dev, emvsim);
-        if (ret)
-                return ret;
-
-	pm_runtime_get_noresume(&pdev->dev);
-	pm_runtime_set_active(&pdev->dev);
-	pm_runtime_enable(&pdev->dev);
-
-	emvsim->open_cnt = 1;
-	ret = clk_prepare_enable(emvsim->ipg);
-	if (ret)
-		return ret;
-	ret = clk_prepare_enable(emvsim->clk);
-	if (ret) {
-		clk_disable_unprepare(emvsim->ipg);
-		return ret;
-	}
-	/* Let pm_runtime_put() disable the clocks.
-	 * If CONFIG_PM is not enabled, the clocks will stay powered.
-	 */
-	pm_runtime_put(&pdev->dev);
-	emvsim->open_cnt = 0;
-
 	ret = misc_register(&emvsim_dev);
-
 	dev_info(&pdev->dev, "emvsim register %s\n", ret ? "fail" : "success");
 
 	return ret;
@@ -1669,84 +1562,62 @@ static int emvsim_probe(struct platform_device *pdev)
 
 static int emvsim_remove(struct platform_device *pdev)
 {
-	pm_runtime_disable(&pdev->dev);
-
-	misc_deregister(&emvsim_dev);
-
-	return 0;
-}
-
-static int __maybe_unused emvsim_suspend(struct device *dev)
-{
-	int err;
-
-	err = pm_runtime_force_suspend(dev);
-	if (err)
-		return err;
-
-	pinctrl_pm_select_sleep_state(dev);
-
-	return 0;
-}
-
-static int __maybe_unused emvsim_runtime_suspend(struct device *dev)
-{
-	struct emvsim_t *emvsim = dev_get_drvdata(dev);
+	struct emvsim_t *emvsim = platform_get_drvdata(pdev);
 
 	if (emvsim->open_cnt) {
 		clk_disable_unprepare(emvsim->clk);
 		clk_disable_unprepare(emvsim->ipg);
 	}
 
-	return 0;
-}
-
-static int __maybe_unused emvsim_resume(struct device *dev)
-{
-	int err;
-
-	err = pm_runtime_force_resume(dev);
-	if (err)
-		return err;
-
-	pinctrl_pm_select_default_state(dev);
+	misc_deregister(&emvsim_dev);
 
 	return 0;
 }
 
-static int __maybe_unused emvsim_runtime_resume(struct device *dev)
+#ifdef CONFIG_PM
+static int emvsim_suspend(struct platform_device *pdev, pm_message_t state)
 {
-	int err;
-	struct emvsim_t *emvsim = dev_get_drvdata(dev);
+	struct emvsim_t *emvsim = platform_get_drvdata(pdev);
 
 	if (emvsim->open_cnt) {
-		err = clk_prepare_enable(emvsim->ipg);
-		if (err)
-			return err;
-		err = clk_prepare_enable(emvsim->clk);
-		if (err) {
-			clk_disable_unprepare(emvsim->ipg);
-			return err;
-		}
+		clk_disable_unprepare(emvsim->clk);
+		clk_disable_unprepare(emvsim->ipg);
 	}
+
+	pinctrl_pm_select_sleep_state(&pdev->dev);
 
 	return 0;
 }
 
-static const struct dev_pm_ops emvsim_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(emvsim_suspend, emvsim_resume)
-	SET_RUNTIME_PM_OPS(emvsim_runtime_suspend, emvsim_runtime_resume, NULL)
-};
+static int emvsim_resume(struct platform_device *pdev)
+{
+	struct emvsim_t *emvsim = platform_get_drvdata(pdev);
+
+	if (!emvsim->open_cnt) {
+		clk_prepare_enable(emvsim->ipg);
+		clk_prepare_enable(emvsim->clk);
+	}
+
+	pinctrl_pm_select_default_state(&pdev->dev);
+
+	return 0;
+}
+
+#else
+#define emvsim_suspend NULL
+#define emvsim_resume NULL
+#endif
 
 static struct platform_driver emvsim_driver = {
 	.driver = {
 		.name = DRIVER_NAME,
 		.owner = THIS_MODULE,
-		.pm = &emvsim_pm_ops,
 		.of_match_table = emvsim_imx_dt_ids,
 	},
 	.probe = emvsim_probe,
 	.remove = emvsim_remove,
+	.suspend = emvsim_suspend,
+	.resume = emvsim_resume,
 };
 
 static int __init emvsim_drv_init(void)
